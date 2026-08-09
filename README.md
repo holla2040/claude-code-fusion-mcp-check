@@ -1,13 +1,34 @@
 # claude-code-fusion-mcp-check
 
-Connecting Claude Code (in WSL) to the Fusion 360 MCP add-in (on Windows) fails in a
-way that looks like several different problems. This repo diagnoses it in one command
-and makes the fix permanent.
+Connecting Claude Code to the Fusion 360 MCP add-in fails in a way that looks like
+several different problems. This repo diagnoses it in one command and makes the fix
+permanent.
 
 ```sh
 ./check.sh      # diagnose, layer by layer
 ./install.sh    # make it durable (run once)
 ```
+
+## The setup this is for
+
+**Claude Code runs inside WSL2. Fusion 360 and its MCP add-in run on Windows.** That
+split is the whole source of the problem — the two are on opposite sides of a network
+boundary, and the add-in rejects connections that cross it.
+
+```
+   WSL2                                  Windows
+   ────                                  ───────
+   Claude Code                           Fusion 360
+        │                                     │
+        │ http://127.0.0.1:27182/mcp          │ MCP add-in (NsMCP10.dll)
+        ▼                                     ▼
+   socat proxy  ──────────────────────►  127.0.0.1:27182
+                  gateway (172.17.x.1)
+```
+
+None of this applies if Claude Code runs natively on Windows, or if Fusion and Claude
+Code are on the same side — there the add-in is already on real loopback and the
+default config works.
 
 ## The actual problem
 
@@ -97,3 +118,7 @@ systemctl --user disable --now fusion-mcp-proxy.service
 rm ~/.config/systemd/user/fusion-mcp-proxy.service ~/.local/bin/fusion-mcp-proxy.sh
 claude mcp remove fusion --scope user
 ```
+
+## License
+
+MIT — see [LICENSE](LICENSE).
