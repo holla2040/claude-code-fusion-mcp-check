@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Diagnose the Claude Code -> Fusion MCP connection from WSL, one layer at a time.
-# Exits non-zero on the first layer that is actually broken, and says what to do.
+# Exits non-zero on the first layer that is actually broken, and says what to do --
+# including the steps that can only be carried out on the Windows side.
 #
 # Usage: ./check.sh [--quiet]
 set -uo pipefail
@@ -10,13 +11,31 @@ URL="http://127.0.0.1:${PORT}/mcp"
 QUIET=0
 [ "${1:-}" = "--quiet" ] && QUIET=1
 
+# Other projects call this script from their own directory, so every command we
+# suggest has to be runnable from wherever the caller happens to be standing.
+SELF_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+INSTALL="$SELF_DIR/install.sh"
+
+SYS=/mnt/c/Windows/System32
+NETSTAT="$SYS/NETSTAT.EXE"
+TASKLIST="$SYS/tasklist.exe"
+NETSH="$SYS/netsh.exe"
+WINCURL="$SYS/curl.exe"
+
 pass() { printf '  \033[32mok\033[0m   %s\n' "$1"; }
 fail() { printf '  \033[31mFAIL\033[0m %s\n' "$1"; }
 warn() { printf '  \033[33mwarn\033[0m %s\n' "$1"; }
 step() { [ "$QUIET" = 1 ] || printf '\n\033[1m%s\033[0m\n' "$1"; }
 fix()  { printf '       \033[36m->\033[0m %s\n' "$1"; }
+# Anything that cannot be done from inside WSL gets flagged loudly, because that is
+# the class of failure that otherwise turns into a scavenger hunt.
+winhdr() { printf '\n       \033[1;33mON WINDOWS (not in WSL):\033[0m %s\n' "$1"; }
+wincmd() { printf '         \033[35m%s\033[0m\n' "$1"; }
+winnote(){ printf '         %s\n' "$1"; }
 
-rpc() { # rpc <body> [session-id] ; prints body, sets RPC_CODE
+INIT='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"fusion-mcp-check","version":"1"}}}'
+
+rpc() { # rpc <body> [session-id] ; prints body then http code on the last line
   local body="$1" sid="${2:-}" args=(-s -m 10 -o /dev/stdout -w '\n%{http_code}'
     -X POST "$URL" -H 'Content-Type: application/json'
     -H 'Accept: application/json, text/event-stream')
@@ -24,7 +43,45 @@ rpc() { # rpc <body> [session-id] ; prints body, sets RPC_CODE
   curl "${args[@]}" -d "$body" 2>/dev/null
 }
 
-INIT='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"fusion-mcp-check","version":"1"}}}'
+have_interop() { [ -x "$NETSTAT" ] && [ -x "$TASKLIST" ]; }
+
+# Every PID listening on Windows loopback :PORT -- there can legitimately be more
+# than one. No early awk exit: that closes the pipe under netstat and leaks
+# "tr: write error: Broken pipe" into the output.
+win_owner_pid() {
+  "$NETSTAT" -ano 2>/dev/null | tr -d '\r' \
+    | awk -v a="127.0.0.1:$PORT" '$1=="TCP" && $2==a && $4=="LISTENING" {print $5}'
+}
+
+win_proc_name() { # win_proc_name <pid>
+  [ -n "${1:-}" ] || return 1
+  "$TASKLIST" /FI "PID eq $1" /FO CSV /NH 2>/dev/null | tr -d '\r' \
+    | head -n1 | cut -d, -f1 | tr -d '"'
+}
+
+fusion_pids() {
+  "$TASKLIST" /FI "IMAGENAME eq Fusion360.exe" /FO CSV /NH 2>/dev/null | tr -d '\r' \
+    | grep -i 'Fusion360.exe' | cut -d, -f2 | tr -d '"'
+}
+
+# When 27182 is already taken the add-in does not fail loudly -- it binds a random
+# port instead. Finding that port is what proves "the add-in is loaded but homeless"
+# rather than "the add-in is not running", which need completely different fixes.
+addin_dynamic_port() {
+  local pid ports prt code
+  for pid in $(fusion_pids); do
+    ports=$("$NETSTAT" -ano 2>/dev/null | tr -d '\r' \
+      | awk -v p="$pid" '$1=="TCP" && $4=="LISTENING" && $5==p && $2 ~ /^127\.0\.0\.1:/ {sub(/.*:/,"",$2); print $2}')
+    for prt in $ports; do
+      [ "$prt" = "$PORT" ] && continue
+      code=$("$WINCURL" -s -m 3 -o NUL -w '%{http_code}' -X POST "http://127.0.0.1:$prt/mcp" \
+        -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+        -d "$INIT" 2>/dev/null | tr -d '\r')
+      [ "$code" = "200" ] && { echo "$prt"; return 0; }
+    done
+  done
+  return 1
+}
 
 # ---------------------------------------------------------------- 1. gateway
 step "1. WSL -> Windows host"
@@ -35,24 +92,116 @@ if [ -z "$GW" ]; then
 fi
 pass "gateway $GW"
 
-# ------------------------------------------------------------ 2. Fusion side
-step "2. Fusion MCP server (Windows side, port $PORT)"
+if ! have_interop; then
+  warn "no Windows interop (/mnt/c not mounted?) -- skipping Windows-side checks"
+  warn "layers 2 and 3 are the ones that usually break; they cannot be checked from here"
+fi
+
+# ------------------------------------------- 2. who owns Windows loopback:PORT
+# The add-in binds 127.0.0.1 ONLY (there is no 0.0.0.0 in NsMCP10.dll), and it
+# silently falls back to a dynamic port when 27182 is occupied. Meanwhile WSL's
+# localhost forwarding republishes any WSL listener on 127.0.0.1:27182 back onto
+# the Windows side as wslrelay.exe. So if the WSL proxy binds before the add-in
+# does, the add-in loses the port and every request loops WSL -> Windows -> WSL.
+step "2. Windows side: who owns 127.0.0.1:$PORT"
+if have_interop; then
+  # Windows lets wslrelay.exe co-bind the same address:port as the add-in, so there
+  # can be TWO holders and netstat's order between them is not stable. "Is Fusion
+  # among the holders" is the only question with a stable answer.
+  HOLDERS=$(win_owner_pid)
+  FUSION_HOLDER=""
+  OTHERS=""
+  for p in $HOLDERS; do
+    n=$(win_proc_name "$p")
+    if [ "$n" = "Fusion360.exe" ]; then FUSION_HOLDER="$p"; else OTHERS="$OTHERS $n($p)"; fi
+  done
+  if [ -n "$FUSION_HOLDER" ]; then
+    pass "Fusion add-in holds 127.0.0.1:$PORT (PID $FUSION_HOLDER)"
+    [ -n "$OTHERS" ] && warn "co-bound:$OTHERS -- harmless, the add-in bound first and keeps the traffic"
+  elif printf '%s' "$OTHERS" | grep -q wslrelay; then
+      fail "wslrelay.exe holds 127.0.0.1:$PORT and the add-in does not -- WSL took the port"
+      DYN=$(addin_dynamic_port) && \
+        fix "The add-in IS loaded, but fell back to dynamic port $DYN. Fusion is fine; the port is the problem."
+      fix "Cause: the WSL proxy bound $PORT before Fusion's add-in could. Order matters."
+      fix "systemctl --user stop fusion-mcp-proxy.service   # release the port first"
+      winhdr "then reload the add-in so it can claim $PORT"
+      winnote "Fusion 360 -> Utilities -> Add-Ins -> Scripts and Add-Ins,"
+      winnote "stop the MCP add-in and start it again (or restart Fusion 360)."
+      fix "$INSTALL   # reinstall the proxy so it waits for the add-in instead of racing it"
+      exit 1
+  elif [ -z "$HOLDERS" ]; then
+    if [ -n "$(fusion_pids)" ]; then
+      fail "nothing is listening on Windows 127.0.0.1:$PORT, but Fusion 360 is running"
+      DYN=$(addin_dynamic_port) && \
+        fix "The add-in is on dynamic port $DYN -- something took $PORT while it was starting."
+      winhdr "load or reload the MCP add-in"
+      winnote "Fusion 360 -> Utilities -> Add-Ins -> Scripts and Add-Ins -> start the MCP add-in."
+    else
+      fail "Fusion 360 is not running on Windows"
+      winhdr "start Fusion 360"
+      winnote "The add-in only listens while Fusion is open, and its tools need an open document."
+    fi
+    exit 1
+  else
+    fail "${OTHERS# } holds 127.0.0.1:$PORT -- not the Fusion add-in"
+    winhdr "stop that process, then reload the MCP add-in in Fusion 360"
+    for p in $HOLDERS; do wincmd "taskkill /PID $p /F"; done
+    exit 1
+  fi
+fi
+
+# --------------------------------------------------- 3. Windows portproxy rule
+# The add-in is loopback-only on the Windows side, so WSL cannot reach it at the
+# gateway IP without a portproxy rule bridging gateway:PORT -> 127.0.0.1:PORT.
+# This rule lives in the registry and survives reboots, but it is pinned to one
+# gateway IP -- and that IP changes across reboots under NAT networking.
+step "3. Windows portproxy rule (${GW}:${PORT} -> 127.0.0.1:${PORT})"
+if have_interop; then
+  RULES=$("$NETSH" interface portproxy show all 2>/dev/null | tr -d '\r')
+  # columns: listen-address  listen-port  connect-address  connect-port
+  RULE_ADDR=$(printf '%s' "$RULES" | awk -v p="$PORT" '$2==p && $3=="127.0.0.1" {print $1; exit}')
+  ADDCMD="netsh interface portproxy add v4tov4 listenaddress=$GW listenport=$PORT connectaddress=127.0.0.1 connectport=$PORT"
+  if [ -z "$RULE_ADDR" ]; then
+    fail "no portproxy rule forwarding to 127.0.0.1:$PORT"
+    winhdr "add it in an Administrator PowerShell (needs elevation, survives reboots)"
+    wincmd "$ADDCMD"
+    exit 1
+  elif [ "$RULE_ADDR" != "$GW" ]; then
+    fail "portproxy rule points at $RULE_ADDR, but the gateway is now $GW (it changes across reboots)"
+    winhdr "repoint it in an Administrator PowerShell"
+    wincmd "netsh interface portproxy delete v4tov4 listenaddress=$RULE_ADDR listenport=$PORT"
+    wincmd "$ADDCMD"
+    exit 1
+  fi
+  pass "portproxy rule present: ${RULE_ADDR}:${PORT} -> 127.0.0.1:${PORT}"
+fi
+
+# ------------------------------------------------- 4. reachability from WSL
+step "4. Fusion MCP server reachable from WSL"
 HOSTCODE=$(curl -s -m 6 -o /dev/null -w '%{http_code}' -X POST "http://${GW}:${PORT}/mcp" \
   -H 'Host: 127.0.0.1:'"$PORT" -H 'Content-Type: application/json' \
   -H 'Accept: application/json, text/event-stream' -d "$INIT" 2>/dev/null)
+RC=$?
 if [ "$HOSTCODE" != "200" ]; then
-  fail "no MCP server answering on ${GW}:${PORT} (got '${HOSTCODE:-no response}')"
-  fix "Start Fusion 360 on Windows and make sure the MCP add-in is loaded."
-  fix "The add-in only listens while Fusion is running."
+  case "$RC" in
+    # Refused and timed-out look identical in the HTTP code (both "000") but mean
+    # opposite things: nobody home vs. somebody accepting and never answering.
+    7)  fail "connection to ${GW}:${PORT} refused -- nothing is accepting there"
+        fix "Layers 2 and 3 passed, so re-run $SELF_DIR/check.sh; the portproxy rule may have just been removed." ;;
+    28) fail "connection to ${GW}:${PORT} accepted but never answered (timeout) -- this is a forwarding loop"
+        fix "Traffic is going WSL -> gateway -> portproxy -> back into WSL instead of reaching Fusion."
+        fix "systemctl --user stop fusion-mcp-proxy.service && $INSTALL" ;;
+    *)  fail "no MCP server answering on ${GW}:${PORT} (http '${HOSTCODE:-none}', curl exit $RC)" ;;
+  esac
   exit 1
 fi
-pass "Fusion MCP server is up and accepting Host: 127.0.0.1:$PORT"
+pass "server answers 200 to Host: 127.0.0.1:$PORT"
 
-# ------------------------------------------------------------------ 3. proxy
-step "3. Loopback proxy (127.0.0.1:$PORT -> ${GW}:${PORT})"
+# ------------------------------------------------------------------ 5. proxy
 # The add-in does DNS-rebinding protection: it accepts ONLY "Host: 127.0.0.1:27182".
 # A direct WSL connection to the gateway IP sends "Host: <gw>:27182" and gets
 # 403 {"error": "Invalid Host header"}. The proxy exists purely to fix that header.
+step "5. Loopback proxy (127.0.0.1:$PORT -> ${GW}:${PORT})"
 DIRECT=$(curl -s -m 6 -o /dev/null -w '%{http_code}' -X POST "http://${GW}:${PORT}/mcp" \
   -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
   -d "$INIT" 2>/dev/null)
@@ -62,15 +211,15 @@ if systemctl --user is-active --quiet fusion-mcp-proxy.service 2>/dev/null; then
   pass "systemd unit fusion-mcp-proxy.service is active"
 elif pgrep -f "socat TCP-LISTEN:${PORT}" >/dev/null 2>&1; then
   warn "a manual socat is running, but no systemd unit -- it dies on reboot"
-  fix "./install.sh   # make it durable"
+  fix "$INSTALL   # make it durable"
 else
   fail "nothing is listening on 127.0.0.1:$PORT"
-  fix "./install.sh   # installs and starts the proxy"
+  fix "$INSTALL   # installs and starts the proxy"
   exit 1
 fi
 
-# ------------------------------------------------------- 4. MCP handshake
-step "4. MCP handshake through the proxy"
+# ------------------------------------------------------- 6. MCP handshake
+step "6. MCP handshake through the proxy"
 HDRS=$(curl -s -m 8 -D - -o /dev/null -X POST "$URL" -H 'Content-Type: application/json' \
   -H 'Accept: application/json, text/event-stream' -d "$INIT" 2>/dev/null)
 SID=$(printf '%s' "$HDRS" | grep -i 'mcp-session-id' | tr -d '\r' | awk '{print $2}')
@@ -102,8 +251,8 @@ fi
 pass "$COUNT tools exposed"
 [ "$QUIET" = 1 ] || printf '%s\n' "$NAMES" | sed 's/^/         - /'
 
-# ------------------------------------------------- 5. Claude Code registration
-step "5. Claude Code registration"
+# ------------------------------------------------- 7. Claude Code registration
+step "7. Claude Code registration"
 if claude mcp list 2>/dev/null | grep -q '^fusion:.*Connected'; then
   pass "claude mcp list reports fusion connected"
 else
