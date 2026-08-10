@@ -57,31 +57,59 @@ fusion_holds() {
   return 1
 }
 
-if ! fusion_holds; then
-  echo "waiting: Fusion add-in does not hold 127.0.0.1:$PORT yet (holders: $(holders | tr '\n' ' '))" >&2
-  exit 1   # Restart=always retries; the port stays free for the add-in meanwhile
-fi
+SOCAT=""
+start_socat() {
+  socat TCP-LISTEN:$PORT,bind=127.0.0.1,fork,reuseaddr "TCP:$GW:$PORT" &
+  SOCAT=$!
+}
+stop_socat() {
+  [ -n "$SOCAT" ] || return 0
+  kill "$SOCAT" 2>/dev/null
+  wait "$SOCAT" 2>/dev/null
+  SOCAT=""
+}
+trap 'stop_socat; exit 0' INT TERM
 
-socat TCP-LISTEN:$PORT,bind=127.0.0.1,fork,reuseaddr "TCP:$GW:$PORT" &
-SOCAT=$!
-trap 'kill $SOCAT 2>/dev/null' INT TERM EXIT
-
-# Release the port as soon as the add-in lets go of it -- otherwise the next
-# Fusion restart finds 27182 occupied by us and drifts to a dynamic port again.
-# Tolerate one bad reading: tearing the proxy down costs a 15s outage, and a
-# single hiccup in the netstat pipeline is not evidence the add-in went away.
+# Supervise in-process instead of exiting and leaning on Restart=always. Both ends
+# of a teardown are user-visible: every second we keep 27182 after the add-in drops
+# it is a second the add-in can lose the port to WSL's relay on its way back, and
+# every second before we rebind is a failing MCP call. A RestartSec pause sits in
+# the middle of both, so the loop stays resident and handles the transitions itself.
+#
+# A netstat poll costs ~35ms, so 5s cadence is nearly free -- and it is fast enough
+# to hand the port back before a restarting Fusion tries to claim it, which is what
+# makes a full Fusion restart survivable without human intervention.
+POLL=5
+MISS_LIMIT=2   # consecutive bad readings before believing the add-in is really gone
 MISSES=0
-while sleep 30; do
-  kill -0 "$SOCAT" 2>/dev/null || exit 1
+WAITING=0
+
+while true; do
   if fusion_holds; then
     MISSES=0
+    if [ -n "$SOCAT" ] && ! kill -0 "$SOCAT" 2>/dev/null; then
+      echo "socat exited unexpectedly; rebinding" >&2
+      SOCAT=""
+    fi
+    if [ -z "$SOCAT" ]; then
+      start_socat
+      echo "add-in holds $PORT; listening on 127.0.0.1:$PORT -> $GW:$PORT" >&2
+      WAITING=0
+    fi
   else
     MISSES=$((MISSES + 1))
-    if [ "$MISSES" -ge 2 ]; then
-      echo "add-in released $PORT (holders: $(holders | tr '\n' ' ')); releasing proxy" >&2
-      exit 1
+    if [ "$MISSES" -ge "$MISS_LIMIT" ]; then
+      if [ -n "$SOCAT" ]; then
+        echo "add-in released $PORT (holders: $(holders | tr '\n' ' ')); handing the port back" >&2
+        stop_socat
+      fi
+      if [ "$WAITING" = 0 ]; then
+        echo "waiting for the Fusion add-in to hold 127.0.0.1:$PORT" >&2
+        WAITING=1
+      fi
     fi
   fi
+  sleep "$POLL"
 done
 EOF
 chmod +x "$BIN"
@@ -108,7 +136,10 @@ pkill -f "socat TCP-LISTEN:${PORT}" 2>/dev/null || true
 sleep 1
 
 systemctl --user daemon-reload
-systemctl --user enable --now fusion-mcp-proxy.service
+systemctl --user enable fusion-mcp-proxy.service
+# restart, not "enable --now": --now is a no-op on an already-running unit, which
+# silently leaves the OLD proxy script resident after this script rewrites it.
+systemctl --user restart fusion-mcp-proxy.service
 
 # The Windows half cannot be installed from here: the portproxy rule needs an
 # elevated shell. Say so explicitly rather than leaving it to check.sh to find.

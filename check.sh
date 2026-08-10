@@ -59,6 +59,11 @@ win_proc_name() { # win_proc_name <pid>
     | head -n1 | cut -d, -f1 | tr -d '"'
 }
 
+wsl_listening() {
+  awk -v p="$(printf '%04X' "$PORT")" \
+    '$4=="0A" && $2=="0100007F:"p {f=1} END {exit !f}' /proc/net/tcp
+}
+
 fusion_pids() {
   "$TASKLIST" /FI "IMAGENAME eq Fusion360.exe" /FO CSV /NH 2>/dev/null | tr -d '\r' \
     | grep -i 'Fusion360.exe' | cut -d, -f2 | tr -d '"'
@@ -207,14 +212,24 @@ DIRECT=$(curl -s -m 6 -o /dev/null -w '%{http_code}' -X POST "http://${GW}:${POR
   -d "$INIT" 2>/dev/null)
 [ "$DIRECT" = "403" ] && pass "confirmed: direct gateway URL is rejected (403), proxy is required"
 
-if systemctl --user is-active --quiet fusion-mcp-proxy.service 2>/dev/null; then
-  pass "systemd unit fusion-mcp-proxy.service is active"
-elif pgrep -f "socat TCP-LISTEN:${PORT}" >/dev/null 2>&1; then
-  warn "a manual socat is running, but no systemd unit -- it dies on reboot"
-  fix "$INSTALL   # make it durable"
+# "the unit is active" is NOT the same as "the port is bound": the supervisor stays
+# resident while it waits for the add-in, so ask the kernel rather than systemd.
+# (Note: `ss` is aliased to gnome-screenshot in some interactive shells here, which
+# makes a manual `ss -ltnp | grep 27182` silently print nothing. /proc is honest.)
+if wsl_listening; then
+  pass "127.0.0.1:$PORT is bound in WSL"
+  if ! systemctl --user is-active --quiet fusion-mcp-proxy.service 2>/dev/null; then
+    warn "bound by something other than the systemd unit -- it will not survive a reboot"
+    fix "$INSTALL   # make it durable"
+  fi
 else
   fail "nothing is listening on 127.0.0.1:$PORT"
-  fix "$INSTALL   # installs and starts the proxy"
+  if systemctl --user is-active --quiet fusion-mcp-proxy.service 2>/dev/null; then
+    fix "The unit is running but has not bound -- it waits for the add-in to hold the"
+    fix "Windows port before taking 27182. Layer 2 above says whether it does."
+  else
+    fix "$INSTALL   # installs and starts the proxy"
+  fi
   exit 1
 fi
 
@@ -279,5 +294,7 @@ if [ -n "$STALE" ]; then
 fi
 
 printf '\n\033[32mFusion MCP is reachable.\033[0m\n'
-printf 'If the tools are missing inside a running Claude Code session, restart it:\n'
-printf 'MCP servers attach at session start, so a mid-session fix is not picked up.\n'
+printf 'If a session still cannot see the tools, that session has to be restarted.\n'
+printf 'Reloading the add-in or restarting Fusion DEREGISTERS the tools from every\n'
+printf 'already-running Claude Code session -- the transport recovers on its own, the\n'
+printf 'client does not. `claude --continue` keeps the conversation.\n'

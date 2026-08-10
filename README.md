@@ -94,11 +94,24 @@ The refused-vs-timeout distinction is the tell. Both show up as HTTP code `000`,
 accepted the connection and never answered — a loop, not an absence. `check.sh`
 separates them.
 
-**The fix is in `install.sh`:** the proxy never binds until it has confirmed
-`Fusion360.exe` owns Windows `127.0.0.1:27182`, and a watchdog releases the port within
-30s of the add-in letting go, so the add-in can reclaim 27182 on its next start instead
-of drifting to a dynamic port. Until Fusion is up, the unit just exits and retries every
-15s — an idle restart loop is the normal resting state, not a failure.
+**The fix is in `install.sh`.** The proxy never binds until it has confirmed
+`Fusion360.exe` holds Windows `127.0.0.1:27182`, and it hands the port straight back
+when the add-in lets go, so the add-in reclaims 27182 on its next start instead of
+drifting to a dynamic port. The unit stays resident and supervises this itself, polling
+every 5s — a `netstat` poll costs ~35ms, and being quick to release is what lets a full
+Fusion restart recover without anyone intervening.
+
+Two details that are easy to get wrong if you rewrite this:
+
+- **Windows lets `wslrelay.exe` co-bind the same `127.0.0.1:27182` as the add-in**, so
+  netstat legitimately lists two holders and their order is *not* stable. Asking "is the
+  same PID still the holder?" flip-flops and tears the proxy down every ~45s. The stable
+  question is "is `Fusion360.exe` among the holders?" — a co-bound relay is harmless,
+  because whoever bound first keeps receiving the traffic.
+- **The unit being `active` does not mean the port is bound.** The supervisor stays
+  active while waiting for the add-in. `check.sh` asks `/proc/net/tcp` instead. Note
+  that `ss` is aliased to `gnome-screenshot` in some interactive shells here, so a
+  manual `ss -ltnp | grep 27182` can print nothing while the socket is perfectly fine.
 
 ## Four other things that cost time to work out
 
