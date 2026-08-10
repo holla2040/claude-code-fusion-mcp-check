@@ -12,6 +12,37 @@ permanent.
 `check.sh` is safe to call from any directory — other projects run it when Fusion tools
 start misbehaving, and every command it suggests is printed as an absolute path.
 
+## When Fusion MCP misbehaves, do this
+
+**Run `~/claude-code-fusion-mcp-check/check.sh` and do what it says.** It names the
+broken layer and prints the exact command. Nothing below needs to be remembered — this
+section exists so you do not have to re-derive it.
+
+| What you see | What it means | What to do |
+|---|---|---|
+| `check.sh` exits 0, but an agent cannot see the Fusion tools | That session is stale. Reloading the add-in or restarting Fusion **deregisters** the tools from every already-running Claude Code session — the transport recovers by itself, the client does not | Restart that session; `claude --continue` keeps the conversation |
+| Layer 2 fails, `wslrelay.exe` holds the port | Something bound 27182 before the add-in, so the add-in silently moved to a random port | Stop the proxy, reload the MCP add-in in Fusion (**Utilities → Add-Ins → Scripts and Add-Ins**), rerun `install.sh`. `check.sh` prints these in order |
+| Layer 2 fails, nothing is listening | Fusion is closed, or the add-in was never started | Open Fusion 360 with a document; start the MCP add-in |
+| Layer 3 fails after a Windows reboot | The WSL gateway IP changed and the `netsh` rule still points at the old one | Run the `delete`/`add` pair `check.sh` prints, in an **Administrator** PowerShell |
+| `ECONNRESET`, or `curl` hangs instead of being refused | A forwarding loop, not a dead server | `check.sh` layer 4 distinguishes these; follow it |
+
+### Things that are easy to get wrong later
+
+- **Start order no longer matters.** The proxy waits for the add-in and hands the port
+  back when it leaves. Open and close Fusion whenever you like; don't sequence anything.
+- **Never delete the `netsh` portproxy rule** as "redundant". The add-in binds
+  `127.0.0.1` only, so that rule is the only path in from WSL. Deleting it breaks
+  everything permanently.
+- **Two processes co-binding `127.0.0.1:27182` is normal**, not a symptom. WSL
+  republishes our own listener as `wslrelay.exe`.
+- **`ss` is aliased to `gnome-screenshot`** in some interactive shells here, so
+  `ss -ltnp | grep 27182` can print nothing while the socket is perfectly healthy. Use
+  `/bin/ss` or `/proc/net/tcp`; `check.sh` already does.
+- **Agents should run `check.sh` and report, not fix.** This is also enforced by
+  `~/.claude/CLAUDE.md` and this repo's `CLAUDE.md`. Ad-hoc workarounds applied from
+  project directories are what left a stray portproxy rule and a port-racing proxy
+  behind, and cost hours to untangle. Fixes belong in this repo.
+
 ## The setup this is for
 
 **Claude Code runs inside WSL2. Fusion 360 and its MCP add-in run on Windows.** That
@@ -155,6 +186,23 @@ fallback port, so "the add-in is loaded but homeless on 62095" is distinguished 
 Layer 7 flags any per-project entries still pointing at a gateway IP, since those 403
 while the user-scope entry works — which presents as Fusion working in some directories
 and not others.
+
+## Making the failure impossible instead of survivable
+
+The supervisor above *handles* the port race. If you would rather the race could not
+exist, the root enabler is WSL republishing our listener onto Windows as `wslrelay.exe`.
+Turning that off means nothing can ever take 27182 from the add-in. In
+`C:\Users\<you>\.wslconfig`, then `wsl --shutdown` from PowerShell:
+
+```ini
+[wsl2]
+localhostForwarding=false
+```
+
+Everything here keeps working unchanged — the proxy still listens on WSL loopback and
+the portproxy rule still bridges the gateway. The cost is that Windows can no longer
+reach WSL-hosted dev servers at `localhost`, which is a real loss if you use that. It is
+not required; it just removes the failure mode by construction.
 
 ## The alternative: mirrored networking
 
