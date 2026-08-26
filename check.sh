@@ -94,9 +94,11 @@ portproxy_listeners() { # every portproxy listen-address on $PORT, one per line
 # When 27182 is already taken the add-in does not fail loudly -- it binds a random
 # port instead. Finding that port is what proves "the add-in is loaded but homeless"
 # rather than "the add-in is not running", which need completely different fixes.
-# Fusion can host OTHER MCP servers in the same process (the AutodeskFusionMCP
-# Python add-in lives on its own configured port, 8765 by default), so answering
-# 200 is not enough -- only serverInfo "MCP Server Adapter" is this add-in.
+# Fusion can host foreign MCP servers in the same process (a third-party add-in
+# on 8765 confused a whole debugging session on 2026-08-25 before being removed
+# -- Autodesk's Fusion MCP on 27182 is the ONLY sanctioned server on this
+# machine), so answering 200 is not enough: only serverInfo "MCP Server Adapter"
+# is the real thing.
 addin_dynamic_port() {
   local pid ports prt body
   for pid in $(fusion_pids); do
