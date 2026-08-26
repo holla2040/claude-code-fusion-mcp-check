@@ -21,8 +21,8 @@ section exists so you do not have to re-derive it.
 | What you see | What it means | What to do |
 |---|---|---|
 | `check.sh` exits 0, but an agent cannot see the Fusion tools | That session is stale. Reloading the add-in or restarting Fusion **deregisters** the tools from every already-running Claude Code session — the transport recovers by itself, the client does not | Restart that session; `claude --continue` keeps the conversation |
-| Layer 2 fails, `wslrelay.exe` holds the port | Something bound 27182 before the add-in, so the add-in silently moved to a random port | Stop the proxy, reload the MCP add-in in Fusion (**Utilities → Add-Ins → Scripts and Add-Ins**), rerun `install.sh`. `check.sh` prints these in order |
-| Layer 2 fails, nothing is listening | Fusion is closed, or the add-in was never started | Open Fusion 360 with a document; start the MCP add-in |
+| Layer 2 fails, `wslrelay.exe` holds the port | Something bound 27182 before the server, so it silently moved to a random port | Stop the proxy, restart the server (**Preferences → General → API → untick and re-tick "Fusion MCP Server"**), rerun `install.sh`. `check.sh` prints these in order |
+| Layer 2 fails, nothing is listening | Fusion is closed, or the "Fusion MCP Server" preference is off | Open Fusion 360 with a document; tick **Preferences → General → API → "Fusion MCP Server"** (the port is set right there — must be 27182) |
 | Layer 3 fails after a Windows reboot | The WSL gateway IP changed and the `netsh` rule still points at the old one | Run the `delete`/`add` pair `check.sh` prints, in an **Administrator** PowerShell |
 | After switching WSL to **mirrored** networking, nothing listens on 27182 and reloading the add-in does nothing | A leftover NAT-era portproxy rule's `0.0.0.0` listener covers loopback and steals the bind from the add-in every time it starts | Delete the rule(s) `check.sh` prints (Administrator PowerShell), **then** reload the add-in. This bit for real on 2026-08-25 |
 | `ECONNRESET`, or `curl` hangs instead of being refused | A forwarding loop, not a dead server | `check.sh` layer 4 distinguishes these; follow it |
@@ -79,9 +79,17 @@ None of this applies if Claude Code runs natively on Windows, or if Fusion and C
 Code are on the same side — there the add-in is already on real loopback and the default
 config works.
 
-## The two things the add-in does
+## The two things the server does
 
-Both were established by reading `NsMCP10.dll` directly, not guessed:
+A note on names: this document says "the add-in" for Autodesk's own MCP server
+(`NsMCP10.dll`), which the **Preferences → General → API → "Fusion MCP Server"**
+checkbox controls — that is the ONLY MCP server sanctioned on this machine. Do not
+confuse it with third-party MCP add-ins installed under `API\AddIns`: one of those
+(port 8765) derailed a whole debugging session on 2026-08-25 before being removed.
+Anything answering MCP from Fusion whose serverInfo is not "MCP Server Adapter" is an
+intruder to remove, not a fallback to use.
+
+Both facts below were established by reading `NsMCP10.dll` directly, not guessed:
 
 1. **It binds `127.0.0.1` only.** The string `0.0.0.0` does not appear in the DLL. So
    nothing outside Windows can reach it without a `netsh interface portproxy` rule
@@ -180,13 +188,13 @@ Two details that are easy to get wrong if you rewrite this:
 
 | Layer | Question | Fixable from WSL? |
 |---|---|---|
-| 1 | Does WSL have a route to the Windows host? | — |
-| 2 | Does the Fusion add-in own Windows `127.0.0.1:27182`, or did something else take it? | no |
-| 3 | Does the portproxy rule exist, and does it point at the current gateway? | no |
+| 1 | Which networking mode, and does WSL have a route to Windows? | — |
+| 2 | Does Fusion's MCP server own Windows `127.0.0.1:27182`, or did something else take it (a `0.0.0.0` wildcard bind included)? | no |
+| 3 | NAT: does the portproxy rule exist and point at the current gateway? Mirrored: are there ZERO portproxy rules on the port? | no |
 | 4 | Is the server reachable from WSL (refused vs. loop vs. answering)? | — |
-| 5 | Is the loopback proxy running, and durable? | yes |
+| 5 | NAT: is the loopback proxy running and durable? Mirrored: is it absent? | yes |
 | 6 | Does a full MCP handshake return tools? | — |
-| 7 | Does Claude Code report `fusion` as connected? | yes |
+| 7 | Does some registration point at `http://127.0.0.1:27182/mcp` and connect? | yes |
 
 It exits non-zero at the first genuinely broken layer. Layers 2 and 3 can only be fixed
 on the Windows side, so those instructions are printed under a bright
@@ -195,9 +203,12 @@ whether it needs an Administrator PowerShell. Layer 2 also probes for the add-in
 fallback port, so "the add-in is loaded but homeless on 62095" is distinguished from
 "the add-in is not running", which need completely different fixes.
 
-Layer 7 flags any per-project entries still pointing at a gateway IP, since those 403
-while the user-scope entry works — which presents as Fusion working in some directories
-and not others.
+Layer 7 accepts any registration name (machines differ) but requires the URL to be the
+literal `http://127.0.0.1:27182/mcp`, and flags every entry — user scope or per-project —
+that uses anything else: gateway IPs are stale (403 in NAT, the LAN router in mirrored)
+and `localhost` resolves IPv6-first to `::1`, which hangs against this IPv4-only
+listener. Stale per-project entries present as Fusion working in some directories and
+not others.
 
 ## Making the failure impossible instead of survivable
 
