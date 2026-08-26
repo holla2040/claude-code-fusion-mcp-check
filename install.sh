@@ -9,6 +9,43 @@ BIN="$HOME/.local/bin/fusion-mcp-proxy.sh"
 UNIT="$HOME/.config/systemd/user/fusion-mcp-proxy.service"
 SYS=/mnt/c/Windows/System32
 
+register() { # user scope, so every project gets it without per-project setup
+  if claude mcp list 2>/dev/null | grep -q "$URL"; then
+    echo "claude: a registration already points at $URL"
+  else
+    claude mcp add --scope user --transport http fusion "$URL"
+  fi
+}
+
+# Mirrored networking shares the Windows loopback: 127.0.0.1:27182 reaches the
+# add-in directly with the right Host header, so the socat proxy and the netsh
+# portproxy rule are not just unnecessary -- leftovers of either actively break
+# the link (a stale 0.0.0.0 rule steals the add-in's bind; a WSL proxy would
+# fight it for the shared port). Install nothing; remove what a NAT-era run left.
+MODE=$(wslinfo --networking-mode 2>/dev/null || echo nat)
+if [ "$MODE" = "mirrored" ]; then
+  echo "mirrored WSL networking: no proxy or portproxy needed -- removing NAT-era leftovers"
+  systemctl --user disable --now fusion-mcp-proxy.service 2>/dev/null || true
+  rm -f "$BIN" "$UNIT"
+  systemctl --user daemon-reload 2>/dev/null || true
+  if [ -x "$SYS/netsh.exe" ]; then
+    LEFTOVER=$("$SYS/netsh.exe" interface portproxy show all 2>/dev/null | tr -d '\r' \
+      | awk -v p="$PORT" '$2==p {print $1}')
+    if [ -n "$LEFTOVER" ]; then
+      echo
+      echo "ON WINDOWS (Administrator PowerShell) -- stale portproxy rules that will steal"
+      echo "the add-in's bind; delete them, then reload the MCP add-in in Fusion:"
+      for a in $LEFTOVER; do
+        echo "  netsh interface portproxy delete v4tov4 listenaddress=$a listenport=$PORT"
+      done
+    fi
+  fi
+  register
+  echo
+  echo "Done. Verify with ./check.sh"
+  exit 0
+fi
+
 command -v socat >/dev/null || { echo "socat is required: sudo apt install socat" >&2; exit 1; }
 
 mkdir -p "$(dirname "$BIN")" "$(dirname "$UNIT")"
@@ -157,12 +194,7 @@ if [ -x "$SYS/netsh.exe" ]; then
   fi
 fi
 
-# User scope, so every project gets it without being registered one at a time.
-if claude mcp list 2>/dev/null | grep -q '^fusion:'; then
-  echo "claude: fusion already registered"
-else
-  claude mcp add --scope user --transport http fusion "$URL"
-fi
+register
 
 echo
 echo "Done. Verify with ./check.sh"

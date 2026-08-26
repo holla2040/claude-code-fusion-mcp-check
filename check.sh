@@ -11,6 +11,13 @@ URL="http://127.0.0.1:${PORT}/mcp"
 QUIET=0
 [ "${1:-}" = "--quiet" ] && QUIET=1
 
+# NAT and mirrored WSL networking need opposite plumbing. NAT: loopback is
+# unreachable, so a Windows portproxy rule + a WSL socat proxy carry the traffic.
+# Mirrored: WSL shares the Windows loopback, 127.0.0.1:27182 reaches the add-in
+# directly, and any leftover NAT-era plumbing actively breaks the link (a stale
+# 0.0.0.0 portproxy rule steals the add-in's bind -- that happened 2026-08-25).
+MODE=$(wslinfo --networking-mode 2>/dev/null || echo nat)
+
 # Other projects call this script from their own directory, so every command we
 # suggest has to be runnable from wherever the caller happens to be standing.
 SELF_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -69,20 +76,38 @@ fusion_pids() {
     | grep -i 'Fusion360.exe' | cut -d, -f2 | tr -d '"'
 }
 
+# A 0.0.0.0 listener covers loopback too, so it steals the bind from the add-in
+# even though win_owner_pid (which matches 127.0.0.1:PORT exactly) sees nothing.
+# In practice the culprit is svchost holding a stale "0.0.0.0 -> 127.0.0.1" netsh
+# portproxy rule left over from a NAT-era install -- a self-loop that also hangs
+# every connection it does receive.
+win_wildcard_pid() {
+  "$NETSTAT" -ano 2>/dev/null | tr -d '\r' \
+    | awk -v a="0.0.0.0:$PORT" '$1=="TCP" && $2==a && $4=="LISTENING" {print $5}'
+}
+
+portproxy_listeners() { # every portproxy listen-address on $PORT, one per line
+  "$NETSH" interface portproxy show all 2>/dev/null | tr -d '\r' \
+    | awk -v p="$PORT" '$2==p {print $1}'
+}
+
 # When 27182 is already taken the add-in does not fail loudly -- it binds a random
 # port instead. Finding that port is what proves "the add-in is loaded but homeless"
 # rather than "the add-in is not running", which need completely different fixes.
+# Fusion can host OTHER MCP servers in the same process (the AutodeskFusionMCP
+# Python add-in lives on its own configured port, 8765 by default), so answering
+# 200 is not enough -- only serverInfo "MCP Server Adapter" is this add-in.
 addin_dynamic_port() {
-  local pid ports prt code
+  local pid ports prt body
   for pid in $(fusion_pids); do
     ports=$("$NETSTAT" -ano 2>/dev/null | tr -d '\r' \
       | awk -v p="$pid" '$1=="TCP" && $4=="LISTENING" && $5==p && $2 ~ /^127\.0\.0\.1:/ {sub(/.*:/,"",$2); print $2}')
     for prt in $ports; do
       [ "$prt" = "$PORT" ] && continue
-      code=$("$WINCURL" -s -m 3 -o NUL -w '%{http_code}' -X POST "http://127.0.0.1:$prt/mcp" \
+      body=$("$WINCURL" -s -m 3 -X POST "http://127.0.0.1:$prt/mcp" \
         -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
         -d "$INIT" 2>/dev/null | tr -d '\r')
-      [ "$code" = "200" ] && { echo "$prt"; return 0; }
+      printf '%s' "$body" | grep -q '"name": *"MCP Server Adapter"' && { echo "$prt"; return 0; }
     done
   done
   return 1
@@ -91,11 +116,16 @@ addin_dynamic_port() {
 # ---------------------------------------------------------------- 1. gateway
 step "1. WSL -> Windows host"
 GW=$(ip route show default | awk '{print $3; exit}')
-if [ -z "$GW" ]; then
+if [ "$MODE" = "mirrored" ]; then
+  # In mirrored mode the default gateway is the LAN router, NOT the Windows
+  # host -- never aim anything at it. Loopback is the route to Windows.
+  pass "mirrored networking -- WSL shares the Windows loopback (gateway $GW is the LAN router, ignore it)"
+elif [ -z "$GW" ]; then
   fail "no default gateway; WSL has no route to the Windows host"
   exit 1
+else
+  pass "NAT networking -- Windows host at gateway $GW"
 fi
-pass "gateway $GW"
 
 if ! have_interop; then
   warn "no Windows interop (/mnt/c not mounted?) -- skipping Windows-side checks"
@@ -129,18 +159,40 @@ if have_interop; then
         fix "The add-in IS loaded, but fell back to dynamic port $DYN. Fusion is fine; the port is the problem."
       fix "Cause: the WSL proxy bound $PORT before Fusion's add-in could. Order matters."
       fix "systemctl --user stop fusion-mcp-proxy.service   # release the port first"
-      winhdr "then reload the add-in so it can claim $PORT"
-      winnote "Fusion 360 -> Utilities -> Add-Ins -> Scripts and Add-Ins,"
-      winnote "stop the MCP add-in and start it again (or restart Fusion 360)."
+      winhdr "then restart the MCP server so it can claim $PORT"
+      winnote "Fusion 360 -> Preferences -> General -> API -> untick and re-tick 'Fusion MCP Server'"
+      winnote "(or restart Fusion 360)."
       fix "$INSTALL   # reinstall the proxy so it waits for the add-in instead of racing it"
       exit 1
   elif [ -z "$HOLDERS" ]; then
+    WILD=$(win_wildcard_pid)
+    if [ -n "$WILD" ]; then
+      # The classic post-mode-switch failure: a stale portproxy rule's 0.0.0.0
+      # listener covers loopback, so the add-in can never (re)claim the port no
+      # matter how many times it is reloaded. Reloading is useless until the
+      # rule is gone -- print the deletes FIRST.
+      WNAMES=""; for p in $WILD; do WNAMES="$WNAMES $(win_proc_name "$p")($p)"; done
+      fail "0.0.0.0:$PORT is held by${WNAMES} -- a wildcard bind covers loopback, so the add-in cannot claim the port"
+      fix "Almost always a stale netsh portproxy rule (svchost owns those listeners)."
+      winhdr "delete the stale rule(s) in an Administrator PowerShell, THEN reload the add-in"
+      PPADDRS=$(portproxy_listeners)
+      if [ -n "$PPADDRS" ]; then
+        for a in $PPADDRS; do
+          wincmd "netsh interface portproxy delete v4tov4 listenaddress=$a listenport=$PORT"
+        done
+      else
+        winnote "(no portproxy rule found -- stop the process holding 0.0.0.0:$PORT instead)"
+      fi
+      winnote "then: Fusion 360 -> Preferences -> General -> API -> untick and re-tick 'Fusion MCP Server'."
+      exit 1
+    fi
     if [ -n "$(fusion_pids)" ]; then
       fail "nothing is listening on Windows 127.0.0.1:$PORT, but Fusion 360 is running"
       DYN=$(addin_dynamic_port) && \
         fix "The add-in is on dynamic port $DYN -- something took $PORT while it was starting."
-      winhdr "load or reload the MCP add-in"
-      winnote "Fusion 360 -> Utilities -> Add-Ins -> Scripts and Add-Ins -> start the MCP add-in."
+      winhdr "restart the MCP server"
+      winnote "Fusion 360 -> Preferences -> General -> API -> untick and re-tick 'Fusion MCP Server'"
+      winnote "(the port lives right there too -- it must match PORT=$PORT in this script)."
     else
       fail "Fusion 360 is not running on Windows"
       winhdr "start Fusion 360"
@@ -156,85 +208,139 @@ if have_interop; then
 fi
 
 # --------------------------------------------------- 3. Windows portproxy rule
-# The add-in is loopback-only on the Windows side, so WSL cannot reach it at the
-# gateway IP without a portproxy rule bridging gateway:PORT -> 127.0.0.1:PORT.
-# This rule lives in the registry and survives reboots, but it is pinned to one
+# NAT: the add-in is loopback-only on the Windows side, so WSL cannot reach it at
+# the gateway IP without a portproxy rule bridging gateway:PORT -> 127.0.0.1:PORT.
+# That rule lives in the registry and survives reboots, but it is pinned to one
 # gateway IP -- and that IP changes across reboots under NAT networking.
-step "3. Windows portproxy rule (${GW}:${PORT} -> 127.0.0.1:${PORT})"
-if have_interop; then
-  RULES=$("$NETSH" interface portproxy show all 2>/dev/null | tr -d '\r')
-  # columns: listen-address  listen-port  connect-address  connect-port
-  RULE_ADDR=$(printf '%s' "$RULES" | awk -v p="$PORT" '$2==p && $3=="127.0.0.1" {print $1; exit}')
-  ADDCMD="netsh interface portproxy add v4tov4 listenaddress=$GW listenport=$PORT connectaddress=127.0.0.1 connectport=$PORT"
-  if [ -z "$RULE_ADDR" ]; then
-    fail "no portproxy rule forwarding to 127.0.0.1:$PORT"
-    winhdr "add it in an Administrator PowerShell (needs elevation, survives reboots)"
-    wincmd "$ADDCMD"
-    exit 1
-  elif [ "$RULE_ADDR" != "$GW" ]; then
-    fail "portproxy rule points at $RULE_ADDR, but the gateway is now $GW (it changes across reboots)"
-    winhdr "repoint it in an Administrator PowerShell"
-    wincmd "netsh interface portproxy delete v4tov4 listenaddress=$RULE_ADDR listenport=$PORT"
-    wincmd "$ADDCMD"
-    exit 1
+# Mirrored: the OPPOSITE. Loopback already reaches the add-in, and any rule on the
+# port is a leftover that can only hurt -- a 0.0.0.0 one steals the add-in's bind
+# outright, and a gateway-IP one now names the LAN router. None may exist.
+if [ "$MODE" = "mirrored" ]; then
+  step "3. Windows portproxy rules on :$PORT (mirrored mode: there must be none)"
+  if have_interop; then
+    PPADDRS=$(portproxy_listeners)
+    if [ -n "$PPADDRS" ]; then
+      fail "leftover NAT-era portproxy rule(s) exist on :$PORT -- mirrored mode neither needs nor tolerates them"
+      winhdr "delete them in an Administrator PowerShell"
+      for a in $PPADDRS; do
+        wincmd "netsh interface portproxy delete v4tov4 listenaddress=$a listenport=$PORT"
+      done
+      exit 1
+    fi
+    pass "no portproxy rules on :$PORT"
   fi
-  pass "portproxy rule present: ${RULE_ADDR}:${PORT} -> 127.0.0.1:${PORT}"
+else
+  step "3. Windows portproxy rule (${GW}:${PORT} -> 127.0.0.1:${PORT})"
+  if have_interop; then
+    RULES=$("$NETSH" interface portproxy show all 2>/dev/null | tr -d '\r')
+    # columns: listen-address  listen-port  connect-address  connect-port
+    RULE_ADDR=$(printf '%s' "$RULES" | awk -v p="$PORT" '$2==p && $3=="127.0.0.1" {print $1; exit}')
+    ADDCMD="netsh interface portproxy add v4tov4 listenaddress=$GW listenport=$PORT connectaddress=127.0.0.1 connectport=$PORT"
+    if [ -z "$RULE_ADDR" ]; then
+      fail "no portproxy rule forwarding to 127.0.0.1:$PORT"
+      winhdr "add it in an Administrator PowerShell (needs elevation, survives reboots)"
+      wincmd "$ADDCMD"
+      exit 1
+    elif [ "$RULE_ADDR" != "$GW" ]; then
+      fail "portproxy rule points at $RULE_ADDR, but the gateway is now $GW (it changes across reboots)"
+      winhdr "repoint it in an Administrator PowerShell"
+      wincmd "netsh interface portproxy delete v4tov4 listenaddress=$RULE_ADDR listenport=$PORT"
+      wincmd "$ADDCMD"
+      exit 1
+    fi
+    pass "portproxy rule present: ${RULE_ADDR}:${PORT} -> 127.0.0.1:${PORT}"
+  fi
 fi
 
 # ------------------------------------------------- 4. reachability from WSL
 step "4. Fusion MCP server reachable from WSL"
-HOSTCODE=$(curl -s -m 6 -o /dev/null -w '%{http_code}' -X POST "http://${GW}:${PORT}/mcp" \
-  -H 'Host: 127.0.0.1:'"$PORT" -H 'Content-Type: application/json' \
-  -H 'Accept: application/json, text/event-stream' -d "$INIT" 2>/dev/null)
-RC=$?
-if [ "$HOSTCODE" != "200" ]; then
-  case "$RC" in
-    # Refused and timed-out look identical in the HTTP code (both "000") but mean
-    # opposite things: nobody home vs. somebody accepting and never answering.
-    7)  fail "connection to ${GW}:${PORT} refused -- nothing is accepting there"
-        fix "Layers 2 and 3 passed, so re-run $SELF_DIR/check.sh; the portproxy rule may have just been removed." ;;
-    28) fail "connection to ${GW}:${PORT} accepted but never answered (timeout) -- this is a forwarding loop"
-        fix "Traffic is going WSL -> gateway -> portproxy -> back into WSL instead of reaching Fusion."
-        fix "systemctl --user stop fusion-mcp-proxy.service && $INSTALL" ;;
-    *)  fail "no MCP server answering on ${GW}:${PORT} (http '${HOSTCODE:-none}', curl exit $RC)" ;;
-  esac
-  exit 1
+if [ "$MODE" = "mirrored" ]; then
+  # Mirrored: 127.0.0.1 IS the Windows loopback, so the Host header is right by
+  # construction and no proxy sits in between -- probe the real URL directly.
+  CODE=$(curl -s -m 6 -o /dev/null -w '%{http_code}' -X POST "$URL" \
+    -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+    -d "$INIT" 2>/dev/null)
+  RC=$?
+  if [ "$CODE" != "200" ]; then
+    case "$RC" in
+      7)  fail "connection to $URL refused, though layer 2 saw the add-in holding the Windows port"
+          fix "Mirrored loopback sharing may be broken -- re-run after 'wsl.exe --shutdown' from PowerShell." ;;
+      28) fail "connection to $URL accepted but never answered (timeout)"
+          fix "Something else is intercepting WSL loopback :$PORT -- check for a leftover proxy: systemctl --user status fusion-mcp-proxy.service" ;;
+      *)  fail "no MCP server answering on $URL (http '${CODE:-none}', curl exit $RC)" ;;
+    esac
+    exit 1
+  fi
+  pass "server answers 200 on $URL (shared loopback, no proxy needed)"
+else
+  HOSTCODE=$(curl -s -m 6 -o /dev/null -w '%{http_code}' -X POST "http://${GW}:${PORT}/mcp" \
+    -H 'Host: 127.0.0.1:'"$PORT" -H 'Content-Type: application/json' \
+    -H 'Accept: application/json, text/event-stream' -d "$INIT" 2>/dev/null)
+  RC=$?
+  if [ "$HOSTCODE" != "200" ]; then
+    case "$RC" in
+      # Refused and timed-out look identical in the HTTP code (both "000") but mean
+      # opposite things: nobody home vs. somebody accepting and never answering.
+      7)  fail "connection to ${GW}:${PORT} refused -- nothing is accepting there"
+          fix "Layers 2 and 3 passed, so re-run $SELF_DIR/check.sh; the portproxy rule may have just been removed." ;;
+      28) fail "connection to ${GW}:${PORT} accepted but never answered (timeout) -- this is a forwarding loop"
+          fix "Traffic is going WSL -> gateway -> portproxy -> back into WSL instead of reaching Fusion."
+          fix "systemctl --user stop fusion-mcp-proxy.service && $INSTALL" ;;
+      *)  fail "no MCP server answering on ${GW}:${PORT} (http '${HOSTCODE:-none}', curl exit $RC)" ;;
+    esac
+    exit 1
+  fi
+  pass "server answers 200 to Host: 127.0.0.1:$PORT"
 fi
-pass "server answers 200 to Host: 127.0.0.1:$PORT"
 
 # ------------------------------------------------------------------ 5. proxy
-# The add-in does DNS-rebinding protection: it accepts ONLY "Host: 127.0.0.1:27182".
-# A direct WSL connection to the gateway IP sends "Host: <gw>:27182" and gets
-# 403 {"error": "Invalid Host header"}. The proxy exists purely to fix that header.
-step "5. Loopback proxy (127.0.0.1:$PORT -> ${GW}:${PORT})"
-DIRECT=$(curl -s -m 6 -o /dev/null -w '%{http_code}' -X POST "http://${GW}:${PORT}/mcp" \
-  -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
-  -d "$INIT" 2>/dev/null)
-[ "$DIRECT" = "403" ] && pass "confirmed: direct gateway URL is rejected (403), proxy is required"
-
-# "the unit is active" is NOT the same as "the port is bound": the supervisor stays
-# resident while it waits for the add-in, so ask the kernel rather than systemd.
-# (Note: `ss` is aliased to gnome-screenshot in some interactive shells here, which
-# makes a manual `ss -ltnp | grep 27182` silently print nothing. /proc is honest.)
-if wsl_listening; then
-  pass "127.0.0.1:$PORT is bound in WSL"
-  if ! systemctl --user is-active --quiet fusion-mcp-proxy.service 2>/dev/null; then
-    warn "bound by something other than the systemd unit -- it will not survive a reboot"
-    fix "$INSTALL   # make it durable"
+# NAT: the add-in does DNS-rebinding protection and accepts ONLY
+# "Host: 127.0.0.1:27182"; a direct WSL connection to the gateway sends
+# "Host: <gw>:27182" and gets 403. The socat proxy exists purely to fix that
+# header. Mirrored: the proxy is not just unnecessary -- if it ever bound WSL
+# loopback :27182 it would fight the add-in for the shared port, so the unit
+# must be gone.
+if [ "$MODE" = "mirrored" ]; then
+  step "5. Loopback proxy (mirrored mode: there must be none)"
+  if systemctl --user is-active --quiet fusion-mcp-proxy.service 2>/dev/null || \
+     systemctl --user is-enabled --quiet fusion-mcp-proxy.service 2>/dev/null; then
+    fail "the NAT-era fusion-mcp-proxy unit is still installed -- on shared loopback it can steal :$PORT from the add-in"
+    fix "systemctl --user disable --now fusion-mcp-proxy.service"
+    fix "rm -f ~/.config/systemd/user/fusion-mcp-proxy.service ~/.local/bin/fusion-mcp-proxy.sh && systemctl --user daemon-reload"
+    exit 1
   fi
+  pass "no proxy unit installed (correct for mirrored mode)"
 else
-  fail "nothing is listening on 127.0.0.1:$PORT"
-  if systemctl --user is-active --quiet fusion-mcp-proxy.service 2>/dev/null; then
-    fix "The unit is running but has not bound -- it waits for the add-in to hold the"
-    fix "Windows port before taking 27182. Layer 2 above says whether it does."
+  step "5. Loopback proxy (127.0.0.1:$PORT -> ${GW}:${PORT})"
+  DIRECT=$(curl -s -m 6 -o /dev/null -w '%{http_code}' -X POST "http://${GW}:${PORT}/mcp" \
+    -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+    -d "$INIT" 2>/dev/null)
+  [ "$DIRECT" = "403" ] && pass "confirmed: direct gateway URL is rejected (403), proxy is required"
+
+  # "the unit is active" is NOT the same as "the port is bound": the supervisor stays
+  # resident while it waits for the add-in, so ask the kernel rather than systemd.
+  # (Note: `ss` is aliased to gnome-screenshot in some interactive shells here, which
+  # makes a manual `ss -ltnp | grep 27182` silently print nothing. /proc is honest.)
+  if wsl_listening; then
+    pass "127.0.0.1:$PORT is bound in WSL"
+    if ! systemctl --user is-active --quiet fusion-mcp-proxy.service 2>/dev/null; then
+      warn "bound by something other than the systemd unit -- it will not survive a reboot"
+      fix "$INSTALL   # make it durable"
+    fi
   else
-    fix "$INSTALL   # installs and starts the proxy"
+    fail "nothing is listening on 127.0.0.1:$PORT"
+    if systemctl --user is-active --quiet fusion-mcp-proxy.service 2>/dev/null; then
+      fix "The unit is running but has not bound -- it waits for the add-in to hold the"
+      fix "Windows port before taking 27182. Layer 2 above says whether it does."
+    else
+      fix "$INSTALL   # installs and starts the proxy"
+    fi
+    exit 1
   fi
-  exit 1
 fi
 
 # ------------------------------------------------------- 6. MCP handshake
-step "6. MCP handshake through the proxy"
+step "6. MCP handshake on $URL"
 HDRS=$(curl -s -m 8 -D - -o /dev/null -X POST "$URL" -H 'Content-Type: application/json' \
   -H 'Accept: application/json, text/event-stream' -d "$INIT" 2>/dev/null)
 SID=$(printf '%s' "$HDRS" | grep -i 'mcp-session-id' | tr -d '\r' | awk '{print $2}')
@@ -267,28 +373,47 @@ pass "$COUNT tools exposed"
 [ "$QUIET" = 1 ] || printf '%s\n' "$NAMES" | sed 's/^/         - /'
 
 # ------------------------------------------------- 7. Claude Code registration
+# The registration name varies by machine ("fusion" here, "autodesk-fusion"
+# elsewhere) -- what matters is that SOME entry points at $URL and connects.
 step "7. Claude Code registration"
-if claude mcp list 2>/dev/null | grep -q '^fusion:.*Connected'; then
-  pass "claude mcp list reports fusion connected"
+MCPLIST=$(claude mcp list 2>/dev/null)
+REGLINE=$(printf '%s\n' "$MCPLIST" | grep -F "$URL" | head -n1)
+if printf '%s' "$REGLINE" | grep -q 'Connected'; then
+  pass "claude mcp list: ${REGLINE%%:*} -> $URL connected"
 else
-  fail "Claude Code does not report fusion as connected"
-  fix "claude mcp add --scope user --transport http fusion $URL"
+  if [ -z "$REGLINE" ]; then
+    fail "no Claude Code registration points at $URL"
+    fix "claude mcp add --scope user --transport http fusion $URL"
+  else
+    fail "registration exists but is not connected: $REGLINE"
+    fix "claude mcp remove ${REGLINE%%:*} && claude mcp add --scope user --transport http ${REGLINE%%:*} $URL"
+  fi
   exit 1
 fi
 
-STALE=$(python3 - <<'PY' 2>/dev/null
-import json,os
+# Any entry (any name, user scope or per-project) whose URL is not literally
+# 127.0.0.1 for this port cannot be trusted: a gateway IP is NAT-era residue
+# (403s in NAT, points at the LAN router in mirrored), and "localhost" resolves
+# IPv6-first to ::1, which hangs against these IPv4-only listeners. Only the
+# explicit IPv4 loopback works everywhere.
+STALE=$(python3 - "$PORT" <<'PY' 2>/dev/null
+import json,os,sys
+port=sys.argv[1]
 p=os.path.expanduser('~/.claude.json')
 try: d=json.load(open(p))
 except Exception: raise SystemExit
+def scan(servers,where):
+    for name,f in (servers or {}).items():
+        u=(f or {}).get('url') or ''
+        if f":{port}" in u and '127.0.0.1' not in u:
+            print(f"{where}: {name} -> {u}")
+scan(d.get('mcpServers'),'user scope')
 for k,v in (d.get('projects') or {}).items():
-    f=((v.get('mcpServers') or {}).get('fusion') or {})
-    if f.get('url') and '127.0.0.1' not in f['url']:
-        print(f"{k} -> {f['url']}")
+    scan((v or {}).get('mcpServers'),k)
 PY
 )
 if [ -n "$STALE" ]; then
-  warn "project entries still pointing at the gateway IP (these will 403):"
+  warn "entries not using 127.0.0.1 for :$PORT (gateway IPs are stale; localhost resolves to ::1 and hangs):"
   printf '%s\n' "$STALE" | sed 's/^/         /'
   fix "Repoint them at $URL, or delete them -- the user-scope entry covers every project."
 fi

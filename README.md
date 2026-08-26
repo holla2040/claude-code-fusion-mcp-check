@@ -24,15 +24,21 @@ section exists so you do not have to re-derive it.
 | Layer 2 fails, `wslrelay.exe` holds the port | Something bound 27182 before the add-in, so the add-in silently moved to a random port | Stop the proxy, reload the MCP add-in in Fusion (**Utilities → Add-Ins → Scripts and Add-Ins**), rerun `install.sh`. `check.sh` prints these in order |
 | Layer 2 fails, nothing is listening | Fusion is closed, or the add-in was never started | Open Fusion 360 with a document; start the MCP add-in |
 | Layer 3 fails after a Windows reboot | The WSL gateway IP changed and the `netsh` rule still points at the old one | Run the `delete`/`add` pair `check.sh` prints, in an **Administrator** PowerShell |
+| After switching WSL to **mirrored** networking, nothing listens on 27182 and reloading the add-in does nothing | A leftover NAT-era portproxy rule's `0.0.0.0` listener covers loopback and steals the bind from the add-in every time it starts | Delete the rule(s) `check.sh` prints (Administrator PowerShell), **then** reload the add-in. This bit for real on 2026-08-25 |
 | `ECONNRESET`, or `curl` hangs instead of being refused | A forwarding loop, not a dead server | `check.sh` layer 4 distinguishes these; follow it |
 
 ### Things that are easy to get wrong later
 
 - **Start order no longer matters.** The proxy waits for the add-in and hands the port
   back when it leaves. Open and close Fusion whenever you like; don't sequence anything.
-- **Never delete the `netsh` portproxy rule** as "redundant". The add-in binds
-  `127.0.0.1` only, so that rule is the only path in from WSL. Deleting it breaks
-  everything permanently.
+- **The portproxy rule's fate depends on the WSL networking mode** — check
+  `wslinfo --networking-mode` before touching it. **NAT**: never delete it as
+  "redundant"; the add-in binds `127.0.0.1` only, so that rule is the only path in
+  from WSL. **Mirrored**: the opposite — every portproxy rule on 27182 must go. A
+  leftover `0.0.0.0` one steals the add-in's bind outright, and a gateway-IP one now
+  names the LAN router. `check.sh` knows the mode and checks the right invariant.
+- **Use the literal `127.0.0.1` in every URL, never the name `localhost`.** The name
+  resolves IPv6-first to `::1`, which hangs against these IPv4-only listeners.
 - **Two processes co-binding `127.0.0.1:27182` is normal**, not a symptom. WSL
   republishes our own listener as `wslrelay.exe`.
 - **`ss` is aliased to `gnome-screenshot`** in some interactive shells here, so
@@ -62,6 +68,12 @@ boundary, and the add-in is bound to the far side of it.
 
 Both hops are load-bearing. The portproxy rule gets you *to* the add-in; the socat proxy
 makes the request *acceptable* to it. Removing either one breaks the connection.
+
+That diagram describes **NAT** networking (the WSL default). Under **mirrored**
+networking (`wslinfo --networking-mode`) WSL shares the Windows loopback: neither hop
+exists, `127.0.0.1:27182` reaches the add-in directly with the right Host header, and
+leftovers of either hop actively break the link. `check.sh` and `install.sh` detect the
+mode and do the right thing for each.
 
 None of this applies if Claude Code runs natively on Windows, or if Fusion and Claude
 Code are on the same side — there the add-in is already on real loopback and the default
@@ -209,11 +221,11 @@ not required; it just removes the failure mode by construction.
 WSL2 on Windows 11 22H2+ supports `networkingMode=mirrored`, which maps WSL's loopback
 onto the Windows loopback. That removes the need for both the proxy and the portproxy
 rule, because `127.0.0.1:27182` reaches the add-in directly with the right Host header.
+`check.sh` and `install.sh` detect the mode automatically and check/install accordingly.
 
-It is not the default recommendation here: it changes networking for **every** WSL
-distro, it interacts badly with some VPN and container setups, and applying it requires
-`wsl --shutdown`, which kills every running WSL session. The proxy is contained and
-reversible. If you want to try mirrored mode anyway, put this in
+Trade-offs before switching: it changes networking for **every** WSL distro, it
+interacts badly with some VPN and container setups, and applying it requires
+`wsl --shutdown`, which kills every running WSL session. To switch, put this in
 `C:\Users\<you>\.wslconfig` and run `wsl --shutdown` from PowerShell:
 
 ```ini
@@ -221,8 +233,14 @@ reversible. If you want to try mirrored mode anyway, put this in
 networkingMode=mirrored
 ```
 
-Then repoint nothing — the URL is already `127.0.0.1`, so you can just
-`systemctl --user disable --now fusion-mcp-proxy.service`.
+**After switching, remove every piece of NAT plumbing — it does not just become
+redundant, it turns hostile.** The registered URL is already `127.0.0.1` so it needs no
+repointing, but run `install.sh` (it removes the proxy unit in mirrored mode) and delete
+every portproxy rule on 27182 in an Administrator PowerShell. The failure this prevents
+is nasty: a leftover `0.0.0.0:27182` rule steals the bind from the add-in on every
+start, so the add-in silently lands on a random port and no amount of reloading fixes
+it. That exact sequence cost a day's debugging on 2026-08-25; `check.sh` layer 2 now
+names it directly.
 
 ## Uninstall
 
