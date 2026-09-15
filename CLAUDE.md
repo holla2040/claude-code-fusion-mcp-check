@@ -1,5 +1,21 @@
 # Working on this repo — and using it from other projects
 
+## Driving Fusion from an agent
+
+- Read [README.md: Driving Fusion](README.md#driving-fusion-including-switching-to-the-schematic)
+  before concluding that switching tabs or editing is unavailable.
+- `~/steinmetz/src/bridge.py` implements script execution and EAGLE commands;
+  `~/steinmetz/docs/fusion-bridge.md` documents `Document.activate()` and the
+  editing rules. `~/ThomsonLint/tools/fusion-electronics-*.ulp` supplies exports.
+- Refresh live tool schemas. On 2026-09-15 a refreshed schema exposed script
+  execution absent from an earlier capture; activation of the series-shunt
+  schematic was verified through HTTP and a subsequent schematic read.
+- Identify documents by ID and object type, not name alone. Read back after
+  activation or edits. Do not mark a mutating script `readOnly`.
+- Do not run PowerShell (owner instruction, 2026-09-15). It is unnecessary for
+  this control path. A failed Windows process probe does not prove Fusion is
+  down when its HTTP endpoint successfully returns live documents.
+
 ## If you are an agent in ANOTHER project and Fusion MCP is misbehaving
 
 Run the check and report the result. Do not fix it yourself:

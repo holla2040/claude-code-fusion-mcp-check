@@ -9,6 +9,62 @@ permanent.
 ./install.sh    # make it durable (run once)
 ```
 
+## Driving Fusion, including switching to the schematic
+
+This repository diagnoses the connection. The working control implementation is
+[Steinmetz's bridge](../steinmetz/src/bridge.py), with the protocol and command
+recipes in [fusion-bridge.md](../steinmetz/docs/fusion-bridge.md).
+[ThomsonLint](../ThomsonLint/README.md) supplies ULP exporters for schematic/board
+connectivity, board stackup, and images.
+
+Verified 2026-09-15: Fusion can execute Python through the same HTTP MCP endpoint;
+no PowerShell or desktop automation is needed. Refresh `tools/list` each session:
+an earlier capture exposed only `purchase` on `fusion_mcp_execute`, while the
+refreshed schema exposed `script` and `document` as well. Do not infer permanent
+capability limits from an old schema. Native client tools may be absent even when
+the direct HTTP bridge works.
+
+1. Start with `fusion_mcp_read` arguments
+   `{"queryType":"document","operation":"open"}` to list open documents.
+2. Use a script to inspect `app.documents`, each document's `objectType`, and
+   `dataFile.id`. Several tabs can have the same name. Select the intended design
+   by ID and confirm its type.
+3. Call `fusion_mcp_execute` with
+   `{"featureType":"script","object":{"script":"<Python source>"}}`.
+   The script must define `run(_context)`. For example:
+
+```python
+import adsk.core
+
+def run(_context):
+    app = adsk.core.Application.get()
+    target_id = "<schematic ID from the live document inspection>"
+    for i in range(app.documents.count):
+        doc = app.documents.item(i)
+        if (doc.dataFile and doc.dataFile.id == target_id
+                and "SchematicDocument" in str(doc.objectType)):
+            print("activate:", doc.activate())
+            return
+    raise RuntimeError("Target schematic not found")
+```
+
+4. Verify by re-reading open documents (`isActive`) and
+   `electronics.Schematic`. Board entities require the board tab; schematic
+   entities require the schematic tab. Wrong-tab reads can return empty arrays.
+
+Circuit edits use Fusion-side
+`app.executeTextCommand('Electron.run "<EAGLE command>;"')` through that same
+script channel. Use Steinmetz's helpers and documented quoting, termination,
+and dialog-handling rules; verify edits by re-reading connectivity or placement.
+Switching tabs was verified here; this does not establish that every editing
+command works in every build. Changes remain unsaved until explicitly saved.
+
+If Windows executable probes fail while a fresh HTTP document query succeeds,
+the diagnostic's "Fusion is not running" conclusion is not reliable for that
+execution environment. On 2026-09-15 the Windows process probe failed while
+Fusion's HTTP reads and script execution worked. Do not change network plumbing
+based on that discrepancy. Owner instruction: do not run PowerShell.
+
 `check.sh` is safe to call from any directory — other projects run it when Fusion tools
 start misbehaving, and every command it suggests is printed as an absolute path.
 
